@@ -15,3 +15,4 @@ markdown-it-py
 MarkupSafe
 requests==2.32.4
 python-dotenv
+pillow

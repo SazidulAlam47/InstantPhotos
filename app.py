@@ -7,11 +7,9 @@ import cloudinary
 import cloudinary.uploader
 import cloudinary.utils
 import os
-import base64
 
 app = Flask(__name__)
 
-# Cloudinary + Remove.bg API setup
 REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
 
 cloudinary.config(
@@ -26,141 +24,174 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/process", methods=["POST"])
-def process():
-    print("==== /process endpoint hit ====")
-
-    if "image" not in request.files:
-        print("DEBUG: No image in request")
-        return "No image uploaded", 400
-
-    file = request.files["image"]
-    print(f"DEBUG: Received image file: {file.filename}")
-    input_image = file.read()
-
-    # Layout settings
-    passport_width = 384
-    passport_height = 472
-    border = 2
-    spacing = 25
-    margin_x = 10
-    margin_y = 15
-    horizontal_gap = 20
-    a4_w, a4_h = 2480, 3508
-    copies = int(request.form.get("copies", 6))
-    print(f"DEBUG: Copies requested = {copies}")
-
+def process_single_image(input_image_bytes):
+    """Remove background, enhance, and return a ready-to-paste passport PIL image."""
     # Step 1: Background removal
-    print("DEBUG: Sending image to remove.bg...")
     response = requests.post(
         "https://api.remove.bg/v1.0/removebg",
-        files={"image_file": input_image},
+        files={"image_file": input_image_bytes},
         data={"size": "auto"},
         headers={"X-Api-Key": REMOVE_BG_API_KEY},
     )
-    print(f"DEBUG: remove.bg response status = {response.status_code}")
 
     if response.status_code != 200:
-        print(f"ERROR: Background removal failed - {response.text}")
         try:
             error_info = response.json()
             if error_info.get("errors"):
                 error_code = error_info["errors"][0].get("code", "unknown_error")
-                return {"error": error_code}, 410
-        except Exception as ex:
-            print("Failed to parse error:", ex)
-
-        return {"error": "bg_removal_failed"}, 500
+                raise ValueError(f"bg_removal_failed:{error_code}:{response.status_code}")
+        except ValueError:
+            raise
+        except Exception:
+            pass
+        raise ValueError(f"bg_removal_failed:unknown:{response.status_code}")
 
     bg_removed = BytesIO(response.content)
     img = Image.open(bg_removed)
-    print(f"DEBUG: Image mode after background removal: {img.mode}")
 
     if img.mode in ("RGBA", "LA"):
-        print("DEBUG: Converting transparent background to white")
         background = Image.new("RGB", img.size, (255, 255, 255))
         background.paste(img, mask=img.split()[-1])
         processed_img = background
     else:
         processed_img = img.convert("RGB")
 
-    # Step 2: Upload cleaned image to Cloudinary
+    # Step 2: Upload to Cloudinary
     buffer = BytesIO()
     processed_img.save(buffer, format="PNG")
     buffer.seek(0)
-    print("DEBUG: Uploading to Cloudinary...")
-
     upload_result = cloudinary.uploader.upload(buffer, resource_type="image")
     image_url = upload_result.get("secure_url")
     public_id = upload_result.get("public_id")
 
-    print(f"DEBUG: Cloudinary URL: {image_url}")
-
     if not image_url:
-        print("ERROR: Failed to get image URL from Cloudinary.")
-        return "Cloudinary upload failed", 500
+        raise ValueError("cloudinary_upload_failed")
 
-    # Step 3: Enhance image via Cloudinary AI
-    print("DEBUG: Enhancing image via Cloudinary...")
-
+    # Step 3: Enhance via Cloudinary AI
     enhanced_url = cloudinary.utils.cloudinary_url(
         public_id,
         transformation=[
-            {"effect": "gen_restore"},  # AI image enhancement
-            {"quality": "auto"},  # auto optimize
-            {"fetch_format": "auto"},  # auto format (webp)
+            {"effect": "gen_restore"},
+            {"quality": "auto"},
+            {"fetch_format": "auto"},
         ],
     )[0]
 
-    print(f"DEBUG: Enhanced image URL = {enhanced_url}")
-
-    # Download enhanced image
     enhanced_img_data = requests.get(enhanced_url).content
     img = Image.open(BytesIO(enhanced_img_data))
-    print("DEBUG: Enhanced image downloaded")
 
-    # Step 4: Convert back to RGB (if needed)
     if img.mode in ("RGBA", "LA"):
-        print("DEBUG: Removing transparency after enhancement")
         background = Image.new("RGB", img.size, (255, 255, 255))
         background.paste(img, mask=img.split()[-1])
         passport_img = background
     else:
         passport_img = img.convert("RGB")
 
-    # Step 5: Resize + border
-    passport_img = passport_img.resize((passport_width, passport_height), Image.LANCZOS)
-    passport_img = ImageOps.expand(passport_img, border=border, fill="black")
-    print(f"DEBUG: Passport image size after border = {passport_img.size}")
+    return passport_img
 
-    # Step 6: Fill A4 layout
-    a4 = Image.new("RGB", (a4_w, a4_h), "white")
-    x, y = margin_x, margin_y
+
+@app.route("/process", methods=["POST"])
+def process():
+    print("==== /process endpoint hit ====")
+
+    # Layout settings
+    passport_width = int(request.form.get("width", 390))
+    passport_height = int(request.form.get("height", 480))
+    border = int(request.form.get("border", 2))
+    spacing = int(request.form.get("spacing", 10))
+    margin_x = 10
+    margin_y = 10
+    horizontal_gap = 10
+    a4_w, a4_h = 2480, 3508
+
+    # Collect images and their copy counts
+    # Supports: image_0, image_1, ... and copies_0, copies_1, ...
+    # Also supports legacy single: image + copies
+    images_data = []
+
+    # Multi-image mode
+    i = 0
+    while f"image_{i}" in request.files:
+        file = request.files[f"image_{i}"]
+        copies = int(request.form.get(f"copies_{i}", 6))
+        images_data.append((file.read(), copies))
+        i += 1
+
+    # Fallback to single image mode
+    if not images_data and "image" in request.files:
+        file = request.files["image"]
+        copies = int(request.form.get("copies", 6))
+        images_data.append((file.read(), copies))
+
+    if not images_data:
+        return "No image uploaded", 400
+
+    print(f"DEBUG: Processing {len(images_data)} image(s)")
+
+    # Process all images
+    passport_images = []
+    for idx, (img_bytes, copies) in enumerate(images_data):
+        print(f"DEBUG: Processing image {idx + 1} with {copies} copies")
+        try:
+            img = process_single_image(img_bytes)
+            img = img.resize((passport_width, passport_height), Image.LANCZOS)
+            img = ImageOps.expand(img, border=border, fill="black")
+            passport_images.append((img, copies))
+        except ValueError as e:
+            err_str = str(e)
+            if "410" in err_str or "face" in err_str.lower():
+                return {"error": "face_detection_failed"}, 410
+            elif "429" in err_str or "quota" in err_str.lower():
+                return {"error": "quota_exceeded"}, 429
+            else:
+                print(err_str)
+                return {"error": err_str}, 500
+                
+
     paste_w = passport_width + 2 * border
     paste_h = passport_height + 2 * border
-    placed = 0
 
-    print("DEBUG: Placing images on A4...")
+    # Build all pages
+    pages = []
+    current_page = Image.new("RGB", (a4_w, a4_h), "white")
+    x, y = margin_x, margin_y
 
-    for _ in range(copies):
-        if x + paste_w > a4_w:
-            x = margin_x
-            y += paste_h + spacing
+    def new_page():
+        nonlocal current_page, x, y
+        pages.append(current_page)
+        current_page = Image.new("RGB", (a4_w, a4_h), "white")
+        x, y = margin_x, margin_y
 
-        if y + paste_h > a4_h:
-            print("DEBUG: Reached end of page")
-            break
+    for passport_img, copies in passport_images:
+        for _ in range(copies):
+            # Move to next row if needed
+            if x + paste_w > a4_w - margin_x:
+                x = margin_x
+                y += paste_h + spacing
 
-        a4.paste(passport_img, (x, y))
-        print(f"DEBUG: Placed copy {placed + 1} at x={x}, y={y}")
-        x += paste_w + horizontal_gap
-        placed += 1
+            # Move to next page if needed
+            if y + paste_h > a4_h - margin_y:
+                new_page()
 
-    print(f"DEBUG: Total placed = {placed}")
+            current_page.paste(passport_img, (x, y))
+            print(f"DEBUG: Placed at x={x}, y={y}")
+            x += paste_w + horizontal_gap
 
-    # Step 7: Export PDF
+    pages.append(current_page)
+    print(f"DEBUG: Total pages = {len(pages)}")
+
+    # Export multi-page PDF
     output = BytesIO()
-    a4.save(output, format="PDF", dpi=(300, 300))
+    if len(pages) == 1:
+        pages[0].save(output, format="PDF", dpi=(300, 300))
+    else:
+        pages[0].save(
+            output,
+            format="PDF",
+            dpi=(300, 300),
+            save_all=True,
+            append_images=pages[1:],
+        )
     output.seek(0)
     print("DEBUG: Returning PDF to client")
 
